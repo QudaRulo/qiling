@@ -303,11 +303,14 @@ def run():
         hook_dictionary = qltui.hook(ql)
 
     # ql run
-    if options.coverage_file:
-        with cov_utils.collect_coverage(ql, options.coverage_format, options.coverage_file):
+    try:
+        if options.coverage_file:
+            with cov_utils.collect_coverage(ql, options.coverage_format, options.coverage_file):
+                ql.run(timeout=options.timeout)
+        else:
             ql.run(timeout=options.timeout)
-    else:
-        ql.run(timeout=options.timeout)
+    except KeyboardInterrupt:
+        ql.log.info("Execution interrupted by user (Ctrl+C)")
 
     if options.json:
         rep = report.generate_report(ql)

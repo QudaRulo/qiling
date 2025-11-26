@@ -415,6 +415,24 @@ def ql_syscall_write(ql: Qiling, fd: int, buf: int, count: int):
     if f is None:
         return -EBADF
 
+    # Handle count == 0 case (valid, write 0 bytes)
+    if count == 0:
+        return 0
+
+    # In real Linux kernel, count is size_t (unsigned). If a negative value
+    # is passed from the emulated program, it's interpreted as a very large
+    # unsigned value. This typically fails when checking if buffer is mapped.
+    # We need to treat count as unsigned to match kernel behavior.
+    if count < 0:
+        # Convert signed to unsigned (e.g., -1 becomes 0xFFFFFFFF on 32-bit)
+        count = count & ((1 << ql.arch.bits) - 1)
+
+        # In real kernel, very large values (> SSIZE_MAX) typically return EINVAL
+        # SSIZE_MAX is typically 0x7FFFFFFF on 32-bit, 0x7FFFFFFFFFFFFFFF on 64-bit
+        ssize_max = (1 << (ql.arch.bits - 1)) - 1
+        if count > ssize_max:
+            return -EINVAL
+
     if not ql.mem.is_mapped(buf, count):
         return -EFAULT
 

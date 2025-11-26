@@ -38,14 +38,60 @@ def __do_open(ql: Qiling, absvpath: str, flags: int, mode: int) -> int:
         return -EEXIST
     except IsADirectoryError:
         return -EISDIR
+    except NotADirectoryError:
+        return -ENOTDIR
     except PermissionError:
         return -EACCES
+    except BlockingIOError:
+        # EAGAIN, EALREADY, EWOULDBLOCK, EINPROGRESS
+        return -EWOULDBLOCK
+    except InterruptedError:
+        # EINTR - interrupted by signal
+        return -EINTR
+    except OSError as e:
+        # Handle other OSError cases with specific errno values
+        # that don't have dedicated exception subclasses in Python
+        import errno
+        error_map = {
+            errno.ELOOP: -ELOOP,           # Too many symbolic links
+            errno.ENAMETOOLONG: -ENAMETOOLONG,  # Filename too long
+            errno.ENFILE: -ENFILE,         # System-wide open file limit
+            errno.ENOMEM: -ENOMEM,         # Out of memory
+            errno.ENOSPC: -ENOSPC,         # No space left on device
+            errno.ENXIO: -ENXIO,           # No such device or address
+            errno.EOPNOTSUPP: -EOPNOTSUPP, # Operation not supported
+            errno.EOVERFLOW: -EOVERFLOW,   # Value too large for data type
+            errno.EPERM: -EPERM,           # Operation not permitted
+            errno.EROFS: -EROFS,           # Read-only filesystem
+            errno.ETXTBSY: -ETXTBSY,       # Text file busy
+            errno.EFAULT: -EFAULT,         # Bad address
+            errno.EDQUOT: -EDQUOT,         # Disk quota exceeded
+            errno.EINVAL: -EINVAL,         # Invalid argument
+        }
+
+        if hasattr(e, 'errno') and e.errno in error_map:
+            return error_map[e.errno]
+
+        # For any unmapped OSError, log it and return a generic error
+        ql.log.warning(f'Unmapped OSError in open(): {e}')
+        return -EIO  # Generic I/O error as fallback
 
     return idx
 
 
 def ql_syscall_open(ql: Qiling, filename: int, flags: int, mode: int):
-    vpath = ql.os.utils.read_cstring(filename)
+    # Handle NULL pointer
+    if filename == 0:
+        ql.log.debug(f'open(NULL, {flags:#x}, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
+    # Check if the memory is accessible before reading
+    try:
+        vpath = ql.os.utils.read_cstring(filename)
+    except:
+        ql.log.debug(f'open(<invalid addr {filename:#x}>, {flags:#x}, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
     absvpath = ql.os.path.virtual_abspath(vpath)
 
     regreturn = __do_open(ql, absvpath, flags, mode)
@@ -56,7 +102,18 @@ def ql_syscall_open(ql: Qiling, filename: int, flags: int, mode: int):
 
 
 def ql_syscall_openat(ql: Qiling, fd: int, path: int, flags: int, mode: int):
-    vpath = ql.os.utils.read_cstring(path)
+    # Handle NULL pointer
+    if path == 0:
+        ql.log.debug(f'openat({fd:d}, NULL, {flags:#x}, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
+    # Check if the memory is accessible before reading
+    try:
+        vpath = ql.os.utils.read_cstring(path)
+    except:
+        ql.log.debug(f'openat({fd:d}, <invalid addr {path:#x}>, {flags:#x}, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
     absvpath = virtual_abspath_at(ql, vpath, fd)
 
     regreturn = absvpath if isinstance(absvpath, int) else __do_open(ql, absvpath, flags, mode)
@@ -67,7 +124,18 @@ def ql_syscall_openat(ql: Qiling, fd: int, path: int, flags: int, mode: int):
 
 
 def ql_syscall_creat(ql: Qiling, filename: int, mode: int):
-    vpath = ql.os.utils.read_cstring(filename)
+    # Handle NULL pointer
+    if filename == 0:
+        ql.log.debug(f'creat(NULL, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
+    # Check if the memory is accessible before reading
+    try:
+        vpath = ql.os.utils.read_cstring(filename)
+    except:
+        ql.log.debug(f'creat(<invalid addr {filename:#x}>, 0{mode:o}) = -EFAULT')
+        return -EFAULT
+
     absvpath = ql.os.path.virtual_abspath(vpath)
 
     flags_class = get_open_flags_class(ql.arch.type, ql.os.type)

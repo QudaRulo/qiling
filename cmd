@@ -1,0 +1,1 @@
+poetry run ./qltool run -f examples/rootfs/x8664_linux/bin/x8664_hello --rootfs examples/rootfs/x8664_linux --coverage-format icfg --coverage-file test_new_icfg.dot

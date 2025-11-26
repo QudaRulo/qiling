@@ -41,4 +41,4 @@ ifrname_override = eth0
 # To use IPv6 or not, to avoid binary double bind. ipv6 and ipv4 bind the same port at the same time
 bindtolocalhost = True
 # Bind to localhost
-ipv6 = False
+ipv6 = True
