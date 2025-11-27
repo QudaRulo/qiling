@@ -52,12 +52,15 @@ class LLMSeedGenerator:
         self.llm = llm
         self.seed_history: List[Seed] = []
         self.best_seed: Optional[Seed] = None
+        self.iteration = 1
 
     async def generate_initial_seeds(
         self,
         target_info: Dict[str, Any],
         vuln_info: Dict[str, Any],
-        num_seeds: int = 5
+        prev_seed: Optional[Seed] = None,
+        coverage_feedback: Optional[Dict[str, float]] = None,
+        history_feedback: Optional[Dict[str, float]] = None,
     ) -> List[Seed]:
         """
         生成初始种子集合
@@ -70,44 +73,66 @@ class LLMSeedGenerator:
         Returns:
             初始种子列表
         """
-        system_prompt = """你是一个专业的IoT漏洞研究专家和 fuzzer 工程师。
-你的任务是结合IDA Pro mcp和漏洞信息(包含漏洞路径节点)为给定的二进制程序生成测试输入(seed), 目标是触发该漏洞路径。
+        system_prompt = f"""你是一个专业的IoT漏洞研究专家和 fuzzer 工程师。
+        ### 主要任务
+        结合IDA Pro mcp, 漏洞信息(包含漏洞路径节点)和多轮程序执行的覆盖反馈, 持续为给定的二进制程序调整测试输入(seed), 直至触发该漏洞路径。
+        
+        ### seed生成策略
+        - 针对漏洞类型设计(如 buffer overflow 需要超长输入)
+        - 考虑程序接收的外部输入格式(如 命令行参数, 环境变量, 文件输入等)
+        ### 变异策略
+        1. 如果程序在某个分支点发生了分歧，分析可能的原因（输入值、条件判断等）
+        2. 针对性地调整输入，使程序走向目标路径
+        3. 考虑常见的绕过技术（如编码、填充、特殊字符等）
+        ### 深入洞察
+        当变异策略停滞不前时, 分析历史seed数据和覆盖情况:
+        1. 哪些节点一直无法覆盖? 可能的原因是什么?
+        2. 覆盖率的变化趋势如何? 
+        3. 应该采取什么策略使得程序走向目标路径? 若无法实现，则说明该路径不可行。
+        
+        **目标程序信息：**
+        {json.dumps(target_info, indent=2, ensure_ascii=False)}
+        **漏洞信息：**
+        {json.dumps(vuln_info, indent=2, ensure_ascii=False)}
+        """ + \
+        """**输出格式要求：**
+        请以 JSON 格式返回, 包含以下字段: 
+        - content: 测试输入的具体内容
+        - format: 输入格式("file", "args", "env", "stdin")
+        - rationale: 生成该输入的理由(简短说明为什么这个输入可能触发漏洞)
+        - analysis: 分析当前问题和调整理由
+        - strategy: 简短说明当前调整策略
 
-请基于：
-1. 目标函数的调用链, 关键的判断条件, 以及漏洞路径的节点信息
-2. 漏洞的类型和特征
-3. 漏洞路径的源点和汇点
-
-生成多样化的输入, 测试输入应该:
-- 针对漏洞类型设计(如 buffer overflow 需要超长输入)
-- 考虑程序的输入格式(如 命令行参数, 环境变量, 文件输入等)
-"""
-
-        task_prompt = f"""请为以下程序生成 {num_seeds} 个测试输入：
-
-**目标程序信息：**
-{json.dumps(target_info, indent=2, ensure_ascii=False)}
-
-**漏洞信息：**
-{json.dumps(vuln_info, indent=2, ensure_ascii=False)}
-
-**输出格式要求：**
-请以 JSON 数组形式返回，每个元素包含：
-- content: 测试输入的具体内容
-- format: 输入格式("file", "args", "env", "stdin")
-- rationale: 生成该输入的理由(简短说明为什么这个输入可能触发漏洞)
-
-示例：
-```json
-[
-  {{
-    "content": "GET /../../../../etc/passwd HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n",
-    "format": "env",
-    "rationale": "路径遍历攻击，尝试触发目录遍历漏洞"
-  }}
-]
-```
-"""
+        示例：
+        ```json
+        {
+            "content": "GET /../../../../etc/passwd HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n",
+            "format": "env",
+            "rationale": "路径遍历攻击，尝试触发目录遍历漏洞",
+            "analysis": "为什么这样调整（分析当前问题和调整理由）",
+            "strategy": "采用的调整策略（如增加长度、修改编码、添加特殊字符等）"
+        }
+        ```
+        """
+        
+        prev_seed_desc = f"""**种子 **
+        ```
+        格式: {prev_seed.format}
+        内容: {prev_seed.content}
+        ``` """ if prev_seed else """""" 
+        coverage_feedback_desc = json.dumps(coverage_feedback, indent=2, ensure_ascii=False) if coverage_feedback else """"""
+        history_feedback_desc = json.dumps(history_feedback, indent=2, ensure_ascii=False) if history_feedback else """"""
+        task_prompt = f"""这是第{self.iteration}次为程序生成测试输入: ,
+        **前一轮执行情况: **
+        {prev_seed_desc}
+        **覆盖反馈: **
+        {coverage_feedback_desc}
+        **最近三轮执行情况(不包含前一轮): 
+        {history_feedback_desc}
+        """
+        print(system_prompt)
+        print("\n")
+        print(task_prompt)
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -117,10 +142,18 @@ class LLMSeedGenerator:
                     "recursion_limit": 50,
                     "debug": True
                 }
-                task_result = agent.ainvoke(
+                # task_result = await agent.ainvoke(
+                #     {"messages": [HumanMessage(content=task_prompt)]},
+                #     config=config
+                # )
+                task_result = None
+                async for item in agent.astream(
                     {"messages": [HumanMessage(content=task_prompt)]},
                     config=config
-                )
+                ):
+                    print(item)
+                    task_result = item
+                # print(task_result.content)
 
                 # 解析 LLM 响应
                 seeds = self._parse_seed_response(task_result.content, generation=0)
@@ -326,10 +359,10 @@ if __name__ == "__main__":
 
     # 初始化 LLM
     llm = ChatOpenAI(
-        model="anthropic/claude-sonnet-4",
+        model="kimi-k2-0905-preview",
         temperature=0.7,
-        api_key="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",
-        base_url="https://openrouter.ai/api/v1"
+        api_key="sk-MkDVKnlqrN7zT4We32elRicls1mZLzLnavy7bBxvICVYM6Jy",
+        base_url="https://api.moonshot.cn/v1"
     )
 
     # 创建生成器
@@ -339,8 +372,7 @@ if __name__ == "__main__":
     target_info = {
         "name": "httpd",
         "type": "web_server",
-        "description": "A lightweight HTTP server",
-        "input_format": "http_request"
+        "description": "Boa HTTP server",
     }
 
     # 漏洞信息
@@ -349,7 +381,7 @@ if __name__ == "__main__":
     }
 
     # 生成初始种子
-    seeds = asyncio.run(generator.generate_initial_seeds(target_info, vuln_info, num_seeds=3))
+    seeds = asyncio.run(generator.generate_initial_seeds(target_info, vuln_info))
 
     print("Generated seeds:")
     for i, seed in enumerate(seeds, 1):
