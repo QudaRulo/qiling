@@ -21,8 +21,10 @@ The output format is determined by file extension:
 
 import json
 from os.path import basename
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from bisect import bisect_right
+from qiling import Qiling
 
 from .base import QlBaseCoverage
 
@@ -132,27 +134,10 @@ class ICFG:
             self.nodes[address].execution_count += 1
             self.execution_trace.append(address)
 
-    def get_statistics(self) -> dict:
-        """Get ICFG statistics."""
-        total_edges = sum(len(node.successors) for node in self.nodes.values())
-        total_lib_calls = sum(len(libs) for libs in self.lib_calls.values())
-        total_lib_returns = sum(len(addrs) for addrs in self.lib_returns.values())
-        total_lib_to_lib = sum(len(libs) for libs in self.lib_to_lib.values())
-
-        return {
-            'total_unique_blocks': len(self.nodes),
-            'total_executions': len(self.execution_trace),
-            'total_internal_edges': total_edges,
-            'total_lib_call_edges': total_lib_calls,
-            'total_lib_return_edges': total_lib_returns,
-            'total_lib_to_lib_edges': total_lib_to_lib,
-            'main_binary': self.main_image_path or 'N/A'
-        }
-
     def to_dict(self) -> dict:
         """Export ICFG to dictionary format."""
         return {
-            'statistics': self.get_statistics(),
+            'main_binary': self.main_image_path or 'N/A',
             'nodes': {hex(addr): node.to_dict() for addr, node in sorted(self.nodes.items())},
             'lib_calls': {hex(addr): sorted(list(libs)) for addr, libs in sorted(self.lib_calls.items())},
             'lib_returns': {lib: [hex(addr) for addr in sorted(addrs)] for lib, addrs in sorted(self.lib_returns.items())},
@@ -175,7 +160,7 @@ class QlICFGCoverage(QlBaseCoverage):
 
     FORMAT_NAME = "icfg"
 
-    def __init__(self, ql, track_main_only: bool = True):
+    def __init__(self, ql: Qiling, track_main_only: bool = True):
         super().__init__(ql)
 
         self.track_main_only = track_main_only
@@ -357,12 +342,6 @@ class QlICFGCoverage(QlBaseCoverage):
             self.ql.hook_del(self.bb_callback)
             self.bb_callback = None
 
-    def get_statistics(self) -> dict:
-        """Get ICFG statistics."""
-        stats = self.icfg.get_statistics()
-        stats['tracking_mode'] = 'main binary only' if self.track_main_only else 'all modules'
-        return stats
-
     def to_dict(self) -> dict:
         """Export ICFG to dictionary format."""
         return self.icfg.to_dict()
@@ -442,34 +421,18 @@ class QlICFGCoverage(QlBaseCoverage):
         - If coverage_file ends with .dot: generates both .dot and .json
         - Otherwise: generates .json and .dot with the base name
         """
-        import os
-
-        stats = self.get_statistics()
-        total_edges = (stats["total_internal_edges"] +
-                      stats["total_lib_call_edges"] +
-                      stats["total_lib_return_edges"] +
-                      stats["total_lib_to_lib_edges"])
-        self.ql.log.info(f'ICFG: {stats["total_unique_blocks"]} unique blocks, '
-                        f'{stats["total_executions"]} executions, '
-                        f'{total_edges} edges '
-                        f'({stats["total_internal_edges"]} internal, '
-                        f'{stats["total_lib_call_edges"]} lib_call, '
-                        f'{stats["total_lib_return_edges"]} lib_return, '
-                        f'{stats["total_lib_to_lib_edges"]} lib_to_lib)')
-
+        coverage_file_path = Path(coverage_file)
         # Determine base filename without extension
-        if coverage_file.endswith('.json'):
-            base_file = coverage_file[:-5]
-            json_file = coverage_file
-            dot_file = base_file + '.dot'
-        elif coverage_file.endswith('.dot'):
-            base_file = coverage_file[:-4]
-            json_file = base_file + '.json'
-            dot_file = coverage_file
+        suffix = coverage_file_path.suffix
+        if suffix == '.json':
+            json_file = coverage_file_path
+            dot_file = coverage_file_path.with_suffix('.dot')
+        elif suffix == '.dot':
+            json_file = coverage_file_path.with_suffix('.json')
+            dot_file = coverage_file_path
         else:
-            base_file = coverage_file
-            json_file = base_file + '.json'
-            dot_file = base_file + '.dot'
+            json_file = coverage_file_path.with_suffix('.json')
+            dot_file = coverage_file_path.with_suffix('.dot')
 
         # Export JSON format
         with open(json_file, 'w') as f:

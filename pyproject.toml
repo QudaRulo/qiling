@@ -1,20 +1,21 @@
-[tool.poetry]
-urls = { homepage = "https://qiling.io" }
+[project]
 name = "qiling"
 version = "1.4.8"
 description = "Qiling is an advanced binary emulation framework that cross-platform-architecture"
-authors = ["KaiJern Lau (xwings) <info@qiling.io>"]
-license = "GPLv2"
+authors = [{ name = "KaiJern Lau (xwings)", email = "info@qiling.io" }]
+license = { text = "GPLv2" }
 readme = "README.md"
+requires-python = ">=3.10"
 classifiers = [
-	"Development Status :: 3 - Beta",
-
+	"Development Status :: 4 - Beta",
 	"Intended Audience :: Developers",
-
-	"Topic :: Software Development :: Disassemblers",
-	"Topic :: System :: Emulators",
-	"Topic :: System :: Operating System",
+	"License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
 	"Topic :: Security",
+	"Topic :: System :: Emulators",
 ]
 keywords = [
 	"qiling",
@@ -25,32 +26,40 @@ keywords = [
 	"UEFI",
 	"IoT",
 ]
+dependencies = [
+	"capstone>=5,<6",
+	"unicorn==2.1.3",
+	"pefile>=2022.5.30",
+	"python-registry>=1.3.1,<2",
+	"keystone-engine>=0.9.2,<1",
+	"pyelftools>=0.28",
+	"gevent>=20.9.0",
+	"multiprocess>=0.70.12.2",
+	"windows-curses>=2.1.0,<3; platform_system == 'Windows'",
+	"pyyaml>=6.0.1,<7",
+	"python-fx",
+	"questionary",
+	"termcolor",
+]
 
-[tool.poetry.dependencies]
-python = "^3.8"
-capstone = "^4"
-unicorn = "2.1.3"
-pefile = ">=2022.5.30"
-python-registry = "^1.3.1"
-keystone-engine = "^0.9.2"
-pyelftools = ">=0.28"
-gevent = ">=20.9.0"
-multiprocess = ">=0.70.12.2"
-windows-curses = { version = "^2.1.0", markers = "platform_system == 'Windows'" }
-pyyaml = "^6.0.1"
-python-fx = "*"
-questionary = "*"
-termcolor = "*"
+[project.optional-dependencies]
+fuzz = [
+	"unicornafl>=2.0.0,<3; platform_system != 'Windows'",
+	"fuzzercorn>=0.0.1,<1; platform_system == 'Linux'",
+]
+RE = ["r2libr>=5.7.4,<6"]
+vperify = [
+	"langchain[openai]>=1.0.0",
+	"langchain-mcp-adapters>=0.1.7",
+	"mcp>=1.22.0",
+]
 
-unicornafl = { version = "^2.0.0", markers = "platform_system != 'Windows'", optional = true }
-fuzzercorn = { version = "^0.0.1", markers = "platform_system == 'Linux'", optional = true }
-
-r2libr = { version = "^5.7.4", optional = true }
-
-[tool.poetry.extras]
-fuzz = ["unicornafl", "fuzzercorn"]
-RE = ["r2libr"]
+[project.urls]
+Homepage = "https://qiling.io"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["mcp[cli]>=1.22.0"]
