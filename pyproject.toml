@@ -52,6 +52,7 @@ vperify = [
 	"langchain[openai]>=1.0.0",
 	"langchain-mcp-adapters>=0.1.7",
 	"mcp>=1.22.0",
+	"colorlog>=6.10.1",
 ]
 
 [project.urls]

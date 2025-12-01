@@ -5,6 +5,7 @@ Path Coverage Analyzer
 """
 
 import json
+from os import PathLike
 from pathlib import Path
 from typing import Any, List, Set, Tuple, Dict, Optional
 from dataclasses import dataclass
@@ -24,38 +25,40 @@ class VulnPath:
 class CoverageResult:
     """路径覆盖分析结果"""
     is_covered: bool  # 是否完整覆盖漏洞路径
-    covered_nodes: List[str]  # 已覆盖的节点
+    covered_nodes: List[str]  # 已覆盖的节点（无序）
     missing_nodes: List[str]  # 未覆盖的节点
-    coverage_ratio: float  # 覆盖率 (0.0 ~ 1.0)
-
-    # 路径分析
-    reached_source: bool  # 是否到达源点
-    reached_sink: bool    # 是否到达汇点
+    # coverage_ratio: float  # 覆盖率 (0.0 ~ 1.0)
 
     # 详细信息
-    execution_trace: List[str]  # 实际执行路径
+    full_execution_trace: List[str]  # 完整的实际执行路径（包含循环、重复）
+    ordered_covered_nodes: List[str]  # 已覆盖节点的有序列表（按执行顺序）
     divergence_point: Optional[str] = None  # 路径分歧点（如果有）
     next_target: Optional[str] = None  # 下一个应该覆盖的节点
+
+    @property
+    def execution_trace(self) -> List[str]:
+        """为了向后兼容，保留这个属性"""
+        return self.ordered_covered_nodes
 
     def to_dict(self) -> dict:
         """转换为字典格式"""
         return {
             "is_covered": self.is_covered,
             "covered_nodes": self.covered_nodes,
+            "ordered_covered_nodes": self.ordered_covered_nodes,
             "missing_nodes": self.missing_nodes,
-            "coverage_ratio": self.coverage_ratio,
-            "reached_source": self.reached_source,
-            "reached_sink": self.reached_sink,
+            # "coverage_ratio": self.coverage_ratio,
             "divergence_point": self.divergence_point,
             "next_target": self.next_target,
-            "execution_trace_length": len(self.execution_trace)
+            # "full_execution_trace_length": len(self.full_execution_trace),
+            # "ordered_covered_nodes_length": len(self.ordered_covered_nodes)
         }
 
 
 class PathCoverageAnalyzer:
     """分析运行时 ICFG 与静态漏洞路径的覆盖情况"""
 
-    def __init__(self, icfg_file: Path):
+    def __init__(self, icfg_file: PathLike):
         """
         初始化分析器
 
@@ -68,7 +71,6 @@ class PathCoverageAnalyzer:
         # 提取执行信息
         self.executed_nodes: Set[str] = set(self.icfg_data.get("nodes", {}).keys())
         self.execution_trace: List[str] = self._extract_execution_trace()
-        self.edges: Dict[str, List[str]] = self._extract_edges()
 
         # 构建地址范围映射：任意地址 -> 所属基本块
         self._addr_to_block: Dict[int, str] = self._build_addr_to_block_mapping()
@@ -85,31 +87,9 @@ class PathCoverageAnalyzer:
         """
         从 ICFG 中提取执行轨迹
 
-        注意：ICFG 中的 execution_trace 在 ICFG 类中定义但没有导出到 JSON
-        这里我们根据 execution_count 重建一个简化版本
+        使用 ICFG 导出的真实执行顺序，包含循环和重复执行的基本块
         """
-        # 按执行次数排序节点（简化方法）
-        nodes = self.icfg_data.get("nodes", {})
-        trace = []
-
-        # 这是一个简化实现，实际可能需要更复杂的路径重建
-        for addr, node_info in sorted(nodes.items(),
-                                     key=lambda x: x[1].get("execution_count", 0),
-                                     reverse=True):
-            trace.append(addr)
-
-        return trace
-
-    def _extract_edges(self) -> Dict[str, List[str]]:
-        """提取控制流边"""
-        edges = {}
-        nodes = self.icfg_data.get("nodes", {})
-
-        for addr, node_info in nodes.items():
-            successors = node_info.get("successors", [])
-            edges[addr] = successors
-
-        return edges
+        return self.icfg_data.get("execution_trace", [])
 
     def _build_addr_to_block_mapping(self) -> Dict[int, str]:
         """
@@ -141,7 +121,7 @@ class PathCoverageAnalyzer:
         规范化地址：如果地址在某个基本块内部，返回该基本块的起始地址
 
         Args:
-            addr: 地址（hex string，如 "0x18518"）
+            addr: 地址(hex string, 如 "0x18518")
 
         Returns:
             规范化后的地址（基本块起始地址）
@@ -161,6 +141,43 @@ class PathCoverageAnalyzer:
         # 如果找不到，返回原地址
         return addr
 
+    def _order_covered_nodes(
+        self,
+        original_nodes: List[str],
+        normalized_nodes: List[str]
+    ) -> List[str]:
+        """
+        基于动态执行轨迹对已覆盖节点进行排序，返回原始地址
+
+        Args:
+            original_nodes: 原始节点地址列表（可能是基本块内部地址）
+            normalized_nodes: 标准化后的节点地址列表（基本块起始地址）
+
+        Returns:
+            按执行顺序排列的原始节点地址列表（去重）
+        """
+        # 建立标准化地址到原始地址的映射（一对多）
+        normalized_to_original = {}
+        for orig, norm in zip(original_nodes, normalized_nodes):
+            if norm not in normalized_to_original:
+                normalized_to_original[norm] = []
+            normalized_to_original[norm].append(orig)
+
+        # 遍历完整执行轨迹，按顺序记录已覆盖节点
+        ordered = []
+        seen_normalized = set()
+
+        for addr in self.execution_trace:
+            # 如果这个基本块对应了漏洞路径中的节点
+            if addr in normalized_to_original and addr not in seen_normalized:
+                # 添加该基本块对应的所有原始地址
+                # 如果同一个基本块有多个节点，它们顺序是确定的（在同一个基本块内）
+                for orig_addr in normalized_to_original[addr]:
+                    ordered.append(orig_addr)
+                seen_normalized.add(addr)
+
+        return ordered
+
     def analyze_coverage(self, vuln_path: VulnPath) -> CoverageResult:
         """
         分析漏洞路径覆盖情况
@@ -173,114 +190,84 @@ class PathCoverageAnalyzer:
         """
         # 规范化漏洞路径中的所有地址
         normalized_path = [self._normalize_address(addr) for addr in vuln_path.path_nodes]
-        normalized_source = self._normalize_address(vuln_path.source)
-        normalized_sink = self._normalize_address(vuln_path.sink)
 
-        # 检查哪些节点被覆盖
-        covered_nodes = []
-        missing_nodes = []
+        # 检查哪些节点被覆盖（保留原始地址和标准化地址）
+        covered_original = []  # 原始地址
+        covered_normalized = []  # 标准化地址
+        missing_nodes = []  # 未覆盖的原始地址
 
         for original_node, normalized_node in zip(vuln_path.path_nodes, normalized_path):
             if normalized_node in self.executed_nodes:
-                covered_nodes.append(normalized_node)
+                covered_original.append(original_node)
+                covered_normalized.append(normalized_node)
             else:
-                missing_nodes.append(normalized_node)
-
-        # 计算覆盖率
-        coverage_ratio = len(covered_nodes) / len(normalized_path) if normalized_path else 0.0
-
-        # 检查源点和汇点（使用规范化后的地址）
-        reached_source = normalized_source in self.executed_nodes
-        reached_sink = normalized_sink in self.executed_nodes
+                missing_nodes.append(original_node)
 
         # 完整覆盖需要所有节点都被执行
         is_covered = len(missing_nodes) == 0
 
-        # 找到分歧点和下一个目标（使用规范化后的路径）
-        divergence_point, next_target = self._find_divergence_and_target_normalized(
-            normalized_path, covered_nodes, missing_nodes
+        # 基于动态执行轨迹对已覆盖节点排序（返回原始地址）
+        ordered_covered_nodes = self._order_covered_nodes(covered_original, covered_normalized)
+
+        # 找到分歧点和下一个目标（使用原始路径和有序的已覆盖节点）
+        divergence_point, next_target = self._find_divergence_and_target(
+            vuln_path.path_nodes, ordered_covered_nodes, missing_nodes
         )
 
         return CoverageResult(
             is_covered=is_covered,
-            covered_nodes=covered_nodes,
+            covered_nodes=covered_original,  # 使用原始地址
             missing_nodes=missing_nodes,
-            coverage_ratio=coverage_ratio,
-            reached_source=reached_source,
-            reached_sink=reached_sink,
-            execution_trace=self.execution_trace,
+            # coverage_ratio=coverage_ratio,
+            full_execution_trace=self.execution_trace,
+            ordered_covered_nodes=ordered_covered_nodes,
             divergence_point=divergence_point,
             next_target=next_target
         )
 
-    def _find_divergence_and_target_normalized(
+    def _find_divergence_and_target(
         self,
-        normalized_path: List[str],
+        path_nodes: List[str],
         covered: List[str],
         missing: List[str]
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        找到路径分歧点和下一个应该覆盖的目标（使用规范化后的路径）
+        找到路径分歧点和下一个应该覆盖的目标(使用原始地址)
 
         Args:
-            normalized_path: 规范化后的漏洞路径（基本块起始地址）
-            covered: 已覆盖的节点
-            missing: 未覆盖的节点
+            path_nodes: 漏洞路径节点(原始地址)
+            covered: 已覆盖的节点(原始地址, 已排序)
+            missing: 未覆盖的节点(原始地址)
 
         Returns:
-            (divergence_point, next_target)
+            (divergence_point, next_target) - 都是原始地址
         """
         if not missing:
             return None, None
 
-        # 找到最后一个被覆盖的节点
+        # 将已覆盖节点转为集合以便快速查找
+        covered_set = set(covered)
+
+        # 找到最后一个被覆盖的节点在原始路径中的索引
         last_covered_idx = -1
-        for i, node in enumerate(normalized_path):
-            if node in covered:
+        for i, node in enumerate(path_nodes):
+            if node in covered_set:
                 last_covered_idx = i
 
         # 如果没有节点被覆盖，第一个节点就是目标
         if last_covered_idx == -1:
-            return None, normalized_path[0] if normalized_path else None
+            return None, path_nodes[0] if path_nodes else None
 
-        # 分歧点是最后一个被覆盖的节点
-        divergence_point = normalized_path[last_covered_idx]
+        # 分歧点是最后一个被覆盖的节点（原始地址）
+        divergence_point = path_nodes[last_covered_idx]
 
-        # 下一个目标是紧接着的未覆盖节点
-        if last_covered_idx + 1 < len(normalized_path):
-            next_target = normalized_path[last_covered_idx + 1]
+        # 下一个目标是紧接着的未覆盖节点（原始地址）
+        if last_covered_idx + 1 < len(path_nodes):
+            next_target = path_nodes[last_covered_idx + 1]
         else:
             next_target = None
 
         return divergence_point, next_target
-
-    def check_path_connectivity(self, vuln_path: VulnPath) -> bool:
-        """
-        检查漏洞路径在运行时 ICFG 中是否连通
-
-        即使所有节点都被执行了，也需要检查它们是否按照预期的顺序连接
-        """
-        if not vuln_path.path_nodes:
-            return False
-
-        # 检查路径中每对相邻节点是否有边连接
-        for i in range(len(vuln_path.path_nodes) - 1):
-            current = vuln_path.path_nodes[i]
-            next_node = vuln_path.path_nodes[i + 1]
-
-            # 检查 current 是否在 ICFG 中
-            if current not in self.edges:
-                return False
-
-            # 检查 next_node 是否是 current 的后继
-            if next_node not in self.edges.get(current, []):
-                return False
-
-        return True
-
-    def get_statistics(self) -> dict:
-        """获取 ICFG 统计信息"""
-        return self.icfg_data.get("statistics", {})
 
     def export_analysis_report(
         self,
@@ -291,14 +278,10 @@ class PathCoverageAnalyzer:
         """导出分析报告"""
         report = {
             "vulnerability": {
-                "type": vuln_path.vuln_type,
-                "description": vuln_path.description,
-                "source": vuln_path.source,
-                "sink": vuln_path.sink,
+                "path_nodes": vuln_path.path_nodes,
                 "path_length": len(vuln_path.path_nodes)
             },
             "coverage": coverage_result.to_dict(),
-            "icfg_statistics": self.get_statistics(),
             "recommendation": self._generate_recommendation(coverage_result)
         }
 
@@ -310,28 +293,21 @@ class PathCoverageAnalyzer:
         if result.is_covered:
             return "路径已完全覆盖，漏洞验证成功！当前输入可作为 PoC payload。"
 
-        if not result.reached_source:
-            return f"未到达源点，需要调整输入使程序执行到 {result.next_target}"
-
-        if result.reached_source and not result.reached_sink:
-            if result.divergence_point:
-                return (f"程序在 {result.divergence_point} 处发生路径分歧，"
-                       f"需要调整输入使程序继续执行到 {result.next_target}")
-            else:
-                return f"需要调整输入以到达下一个目标节点 {result.next_target}"
-
-        return "路径覆盖不完整，需要进一步分析。"
+        # 未完全覆盖的情况
+        if result.divergence_point:
+            return (f"程序在 {result.divergence_point} 处发生路径分歧，"
+                   f"需要调整输入使程序继续执行到 {result.next_target}")
+        elif result.next_target:
+            return f"需要调整输入以到达下一个目标节点 {result.next_target}"
+        else:
+            return f"路径覆盖不完整, 需要进一步分析。"
 
 
 # 示例使用
 if __name__ == "__main__":
     # 示例漏洞路径
     example_vuln = VulnPath(
-        source="0x9a6c",
-        sink="0x99d4",
-        path_nodes=["0x9a6c", "0x99d4"],
-        vuln_type="buffer_overflow",
-        description="Buffer overflow in input parsing"
+        path_nodes=["0x9a6c", "0x99d4"]
     )
 
     # 分析覆盖情况
@@ -340,7 +316,8 @@ if __name__ == "__main__":
 
     print("Coverage Analysis:")
     print(f"  Covered: {result.is_covered}")
-    print(f"  Ratio: {result.coverage_ratio:.2%}")
-    print(f"  Reached source: {result.reached_source}")
-    print(f"  Reached sink: {result.reached_sink}")
+    # print(f"  Coverage ratio: {result.coverage_ratio:.2%}")
+    print(f"  Covered nodes: {len(result.covered_nodes)}/{len(example_vuln.path_nodes)}")
+    print(f"  Missing nodes: {result.missing_nodes}")
     print(f"  Next target: {result.next_target}")
+    print(f"  Divergence point: {result.divergence_point}")

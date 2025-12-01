@@ -1,10 +1,11 @@
 """
 LLM-Driven Seed Generator
 
-使用 LLM 智能生成和调整测试输入（seed），用于漏洞路径覆盖
+使用 LLM 智能生成和调整测试输入(seed), 用于漏洞路径覆盖
 """
 
 import json
+import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
@@ -13,55 +14,107 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.agents import create_agent
 from mcp import ClientSession, StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
+logger = logging.getLogger(__file__)
 
 @dataclass
 class Seed:
     """测试种子"""
     content: str  # 种子内容（可以是文件内容、命令行参数、网络请求等）
-    format: str   # 种子格式 ("file", "args", "http_request", "stdin")
-    metadata: Dict[str, Any]  # 额外元数据
+    input_format: str   # 种子格式 ("args", "env", "stdin")
+    env: Optional[Dict[str, str]] = None  # 额外的环境变量
+    metadata: Optional[Dict[str, Any]] = None  # 额外的元数据
 
     generation: int = 0  # 第几代种子
-    parent_id: Optional[str] = None  # 父种子ID
-    coverage_score: float = 0.0  # 覆盖得分
+    # coverage_score: float = 0.0  # 覆盖得分
 
     def to_dict(self) -> dict:
         return asdict(self)
 
-server_params = StdioServerParameters(
-    command="D:/Program Files/Python312/python.exe",
-    args=[
-        "D:/Program Files/Python312/Lib/site-packages/ida_pro_mcp/server.py",
-        "--ida-rpc",
-        "http://127.0.0.1:13337"
-    ]
-)
 
 class LLMSeedGenerator:
     """基于 LLM 的智能种子生成器"""
 
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm: ChatOpenAI, mcp_url: str = "http://localhost:13337/mcp"):
         """
         初始化生成器
 
         Args:
             llm: ChatOpenAI 实例
+            mcp_url: MCP服务器的HTTP URL
         """
         self.llm = llm
         self.seed_history: List[Seed] = []
         self.best_seed: Optional[Seed] = None
         self.iteration = 1
+        self.mcp_url = mcp_url
 
-    async def generate_initial_seeds(
+        # MCP相关的类成员，用于多轮对话
+        self.session: Optional[ClientSession] = None
+        self.agent = None
+        self.tools = None
+        self._client_exit_stack = None  # 保存client的退出方法
+        self._session_exit_stack = None  # 保存session的退出方法
+
+    async def initialize(self):
+        """
+        初始化MCP连接和Agent
+        必须在使用generate_seed之前调用一次
+        """
+        if self.session is not None:
+            # 已经初始化过了
+            return
+
+        # 手动管理HTTP client的生命周期
+        client_context = streamablehttp_client(url=self.mcp_url)
+        read, write, _ = await client_context.__aenter__()
+        self._client_exit_stack = client_context
+
+        # 手动管理Session的生命周期
+        session_context = ClientSession(read, write)
+        self.session = await session_context.__aenter__()
+        self._session_exit_stack = session_context
+
+        # 初始化session并加载tools
+        await self.session.initialize()
+        self.tools = await load_mcp_tools(self.session)
+
+        print(f"[*] MCP Session initialized with {len(self.tools)} tools")
+
+    async def close(self):
+        """
+        关闭MCP连接
+        在使用完generator后调用
+        """
+        if self._session_exit_stack:
+            try:
+                await self._session_exit_stack.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"[!] Error closing session: {e}")
+
+        if self._client_exit_stack:
+            try:
+                await self._client_exit_stack.__aexit__(None, None, None)
+            except Exception as e:
+                print(f"[!] Error closing client: {e}")
+
+        self.session = None
+        self.agent = None
+        self.tools = None
+        self._client_exit_stack = None
+        self._session_exit_stack = None
+        print("[*] MCP Session closed")
+
+    async def generate_seed(
         self,
         target_info: Dict[str, Any],
         vuln_info: Dict[str, Any],
-        prev_seed: Optional[Seed] = None,
         coverage_feedback: Optional[Dict[str, float]] = None,
         history_feedback: Optional[Dict[str, float]] = None,
-    ) -> List[Seed]:
+    ) -> Seed:
         """
         生成初始种子集合
 
@@ -73,7 +126,7 @@ class LLMSeedGenerator:
         Returns:
             初始种子列表
         """
-        system_prompt = f"""你是一个专业的IoT漏洞研究专家和 fuzzer 工程师。
+        system_prompt = f"""你是一个专业的IoT漏洞研究专家。
         ### 主要任务
         结合IDA Pro mcp, 漏洞信息(包含漏洞路径节点)和多轮程序执行的覆盖反馈, 持续为给定的二进制程序调整测试输入(seed), 直至触发该漏洞路径。
         
@@ -97,8 +150,8 @@ class LLMSeedGenerator:
         """ + \
         """**输出格式要求：**
         请以 JSON 格式返回, 包含以下字段: 
-        - content: 测试输入的具体内容
-        - format: 输入格式("file", "args", "env", "stdin")
+        - content: 测试输入的具体内容, 不可出现 "A"*4这种代码写法, 而必须是"AAAA"这种原始输入
+        - input_format: 输入格式("args", "stdin")
         - rationale: 生成该输入的理由(简短说明为什么这个输入可能触发漏洞)
         - analysis: 分析当前问题和调整理由
         - strategy: 简短说明当前调整策略
@@ -106,8 +159,9 @@ class LLMSeedGenerator:
         示例：
         ```json
         {
-            "content": "GET /../../../../etc/passwd HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n",
-            "format": "env",
+            "content": "具体的内容",
+            "input_format": "应该以什么方式将输入传递给程序",
+            "env": "除了输入内容外, 需要设置哪些环境变量, 若不需要则设为空字典",
             "rationale": "路径遍历攻击，尝试触发目录遍历漏洞",
             "analysis": "为什么这样调整（分析当前问题和调整理由）",
             "strategy": "采用的调整策略（如增加长度、修改编码、添加特殊字符等）"
@@ -115,11 +169,12 @@ class LLMSeedGenerator:
         ```
         """
         
+        prev_seed = self.seed_history[-1] if self.seed_history else None
         prev_seed_desc = f"""**种子 **
         ```
-        格式: {prev_seed.format}
+        格式: {prev_seed.input_format}
         内容: {prev_seed.content}
-        ``` """ if prev_seed else """""" 
+        ``` """ if prev_seed else """"""
         coverage_feedback_desc = json.dumps(coverage_feedback, indent=2, ensure_ascii=False) if coverage_feedback else """"""
         history_feedback_desc = json.dumps(history_feedback, indent=2, ensure_ascii=False) if history_feedback else """"""
         task_prompt = f"""这是第{self.iteration}次为程序生成测试输入: ,
@@ -127,163 +182,70 @@ class LLMSeedGenerator:
         {prev_seed_desc}
         **覆盖反馈: **
         {coverage_feedback_desc}
-        **最近三轮执行情况(不包含前一轮): 
+        **最近三轮执行情况(不包含前一轮):
         {history_feedback_desc}
         """
-        print(system_prompt)
-        print("\n")
-        print(task_prompt)
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await load_mcp_tools(session)
-                agent = create_agent(self.llm, tools=tools, system_prompt=system_prompt)
-                config = {
-                    "recursion_limit": 50,
-                    "debug": True
-                }
-                # task_result = await agent.ainvoke(
-                #     {"messages": [HumanMessage(content=task_prompt)]},
-                #     config=config
-                # )
-                task_result = None
-                async for item in agent.astream(
-                    {"messages": [HumanMessage(content=task_prompt)]},
-                    config=config
-                ):
-                    print(item)
-                    task_result = item
-                # print(task_result.content)
 
-                # 解析 LLM 响应
-                seeds = self._parse_seed_response(task_result.content, generation=0)
-                self.seed_history.extend(seeds)
-                return seeds
+        # 确保已初始化
+        if self.session is None or self.tools is None:
+            raise RuntimeError("Generator not initialized. Call initialize() first.")
 
-    def mutate_seed(
-        self,
-        seed: Seed,
-        coverage_feedback: Dict[str, Any],
-        target_node: Optional[str] = None
-    ) -> Seed:
-        """
-        根据覆盖反馈变异种子
+        # 创建或复用agent
+        if self.agent is None:
+            logger.debug(system_prompt)
+            self.agent = create_agent(self.llm, tools=self.tools, system_prompt=system_prompt)
 
-        Args:
-            seed: 要变异的种子
-            coverage_feedback: 覆盖反馈信息
-            target_node: 下一个目标节点地址
+        logger.debug(task_prompt)
+        config = {
+            "recursion_limit": 50,
+            "debug": True
+        }
+        task_result = None
+        async for item in self.agent.astream(
+            {"messages": [HumanMessage(content=task_prompt)]},
+            config=config
+        ):
+            if isinstance(item, dict):
+                # Handle agent messages
+                if 'model' in item and 'messages' in item['model']:
+                    for message in item['model']['messages']:
+                        if isinstance(message, AIMessage):
+                            if message.content:
+                                print(f"AI: {message.content}")
+                                logger.debug(f"AI: {message.content}")
+                                task_result = message.content
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                for tool_call in message.tool_calls:
+                                    tool_name = tool_call.get("name", "unknown")
+                                    tool_args = tool_call.get("args", {})
+                                    tool_input = ', '.join([f"{key}={value}" for key, value in tool_args.items()])
+                                    print(f"Tool call: {tool_name} with input {tool_input}")
+                                    logger.debug(f"Tool call: {tool_name} with input {tool_input}")
+                # Handle tool messages
+                elif 'tools' in item and 'messages' in item['tools']:
+                    for message in item['tools']['messages']:
+                        if isinstance(message, ToolMessage):
+                            print(f"Tool: {message.name}, result: {message.content}")
+                            logger.debug(f"Tool: {message.name}, result: {message.content}")
+                else:
+                    print(f"Unknown dict structure: {list(item.keys())}")
+                    logger.debug(f"Unknown dict structure: {list(item.keys())}")
+            else:
+                print(f"Unknown message type: {type(item).__name__} - {item}")
+                logger.debug(f"Unknown message type: {type(item).__name__} - {item}")
 
-        Returns:
-            变异后的新种子
-        """
-        system_prompt = """你是一个专业的漏洞研究专家。
-你需要基于程序执行的覆盖反馈，智能调整测试输入，以便覆盖更多的漏洞路径。
+        # 解析 LLM 响应
+        seed = self._parse_seed_response(task_result, generation=0)
+        self.seed_history.append(seed)
+        self.iteration += 1
 
-分析策略：
-1. 如果程序在某个分支点发生了分歧，分析可能的原因（输入值、条件判断等）
-2. 针对性地调整输入，使程序走向目标路径
-3. 考虑常见的绕过技术（如编码、填充、特殊字符等）
-"""
-
-        user_prompt = f"""基于以下反馈，请调整测试输入：
-
-**当前种子：**
-```
-格式：{seed.format}
-内容：{seed.content}
-```
-
-**覆盖反馈：**
-{json.dumps(coverage_feedback, indent=2, ensure_ascii=False)}
-
-**目标节点：** {target_node if target_node else "未指定"}
-
-**任务：**
-1. 分析为什么当前输入没有覆盖目标路径
-2. 提出具体的调整策略
-3. 生成新的测试输入
-
-**输出格式：**
-```json
-{{
-  "content": "新的测试输入内容",
-  "format": "输入格式",
-  "analysis": "为什么这样调整（分析当前问题和调整理由）",
-  "strategy": "采用的调整策略（如增加长度、修改编码、添加特殊字符等）"
-}}
-```
-"""
-
-        response = self.llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ])
-
-        # 解析变异结果
-        new_seeds = self._parse_seed_response(
-            response.content,
-            generation=seed.generation + 1,
-            parent_id=id(seed)
-        )
-
-        if new_seeds:
-            new_seed = new_seeds[0]
-            self.seed_history.append(new_seed)
-            return new_seed
-        else:
-            # 如果解析失败，返回原种子
-            return seed
-
-    def analyze_and_guide(
-        self,
-        coverage_results: List[Dict[str, Any]],
-        vuln_path: Dict[str, Any]
-    ) -> str:
-        """
-        分析多次执行的覆盖结果，给出调整建议
-
-        Args:
-            coverage_results: 历史覆盖结果列表
-            vuln_path: 漏洞路径信息
-
-        Returns:
-            调整建议（自然语言）
-        """
-        system_prompt = """你是一个专业的漏洞研究专家和程序分析专家。
-你需要分析多次程序执行的覆盖情况，找出规律，给出下一步的调整方向。
-"""
-
-        user_prompt = f"""请分析以下执行历史，给出调整建议：
-
-**漏洞路径：**
-{json.dumps(vuln_path, indent=2, ensure_ascii=False)}
-
-**执行历史（最近 {len(coverage_results)} 次）：**
-{json.dumps(coverage_results, indent=2, ensure_ascii=False)}
-
-**请分析：**
-1. 哪些节点一直无法覆盖？可能的原因是什么？
-2. 覆盖率的变化趋势如何？
-3. 应该采取什么策略来提高覆盖率？
-4. 具体的下一步行动建议是什么？
-
-请给出简明扼要的分析和建议。
-"""
-
-        response = self.llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ])
-
-        return response.content
+        return seed
 
     def _parse_seed_response(
         self,
         response_text: str,
         generation: int,
-        parent_id: Optional[str] = None
-    ) -> List[Seed]:
+    ) -> Optional[Seed]:
         """
         解析 LLM 返回的种子 JSON
 
@@ -295,51 +257,45 @@ class LLMSeedGenerator:
         Returns:
             Seed 对象列表
         """
-        seeds = []
-
+        seed = None
         # 尝试提取 JSON 代码块
-        import re
-        json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_text = json_match.group(1)
+        if response_text.startswith('```json'):
+            json_text = response_text[7:-3].strip()
         else:
             # 如果没有代码块，尝试直接解析整个响应
-            json_text = response_text
+            import re
+            json_match = re.search(r'```json\s*(.*?)\s*```', response_text, re.DOTALL)
+            if json_match:
+                json_text = json_match.group(1)
+            else:
+                # 如果没有代码块，尝试直接解析整个响应
+                json_text = response_text
 
         try:
             data = json.loads(json_text)
-
-            # 处理单个对象或数组
-            if isinstance(data, dict):
-                data = [data]
-
-            for item in data:
-                seed = Seed(
-                    content=item.get("content", ""),
-                    format=item.get("format", "unknown"),
-                    metadata={
-                        "rationale": item.get("rationale", ""),
-                        "analysis": item.get("analysis", ""),
-                        "strategy": item.get("strategy", "")
-                    },
-                    generation=generation,
-                    parent_id=parent_id
-                )
-                seeds.append(seed)
-
+            seed = Seed(
+                content=data.get("content", ""),
+                input_format=data.get("input_format", "unknown"),
+                metadata={
+                    "rationale": data.get("rationale", ""),
+                    "analysis": data.get("analysis", ""),
+                    "strategy": data.get("strategy", "")
+                },
+                generation=generation,
+            )
         except json.JSONDecodeError as e:
             print(f"Failed to parse LLM response as JSON: {e}")
             print(f"Response text: {response_text[:200]}...")
 
-        return seeds
+        return seed
 
-    def update_seed_score(self, seed: Seed, coverage_score: float):
-        """更新种子的覆盖得分"""
-        seed.coverage_score = coverage_score
+    # def update_seed_score(self, seed: Seed, coverage_score: float):
+    #     """更新种子的覆盖得分"""
+    #     seed.coverage_score = coverage_score
 
-        # 更新最佳种子
-        if self.best_seed is None or coverage_score > self.best_seed.coverage_score:
-            self.best_seed = seed
+    #     # 更新最佳种子
+    #     if self.best_seed is None or coverage_score > self.best_seed.coverage_score:
+    #         self.best_seed = seed
 
     def export_seed_history(self, output_file: Path):
         """导出种子历史"""
@@ -357,34 +313,68 @@ class LLMSeedGenerator:
 if __name__ == "__main__":
     from langchain_openai import ChatOpenAI
 
-    # 初始化 LLM
-    llm = ChatOpenAI(
-        model="kimi-k2-0905-preview",
-        temperature=0.7,
-        api_key="sk-MkDVKnlqrN7zT4We32elRicls1mZLzLnavy7bBxvICVYM6Jy",
-        base_url="https://api.moonshot.cn/v1"
-    )
+    async def main():
+        # 初始化 LLM
+        llm = ChatOpenAI(
+            model="kimi-k2-0905-preview",
+            temperature=0.7,
+            api_key="sk-MkDVKnlqrN7zT4We32elRicls1mZLzLnavy7bBxvICVYM6Jy",
+            base_url="https://api.moonshot.cn/v1"
+        )
 
-    # 创建生成器
-    generator = LLMSeedGenerator(llm)
+        # 创建生成器
+        generator = LLMSeedGenerator(llm)
 
-    # 目标程序信息
-    target_info = {
-        "name": "httpd",
-        "type": "web_server",
-        "description": "Boa HTTP server",
-    }
+        try:
+            # 初始化MCP连接（只需调用一次）
+            await generator.initialize()
 
-    # 漏洞信息
-    vuln_info = {
-        "path_node": ["0x1850c", "0x18518", "0x18528", "0x18538"],
-    }
+            # 目标程序信息
+            target_info = {
+                "name": "portal.cgi",
+                "type": "cgi",
+                "description": "cgi程序",
+            }
 
-    # 生成初始种子
-    seeds = asyncio.run(generator.generate_initial_seeds(target_info, vuln_info))
+            # 漏洞信息
+            vuln_info = {
+                "path_node": ["0x41904c", "0x419054", "0x41906c", "0x419084", "0x419134", "0x41913c"],
+            }
 
-    print("Generated seeds:")
-    for i, seed in enumerate(seeds, 1):
-        print(f"\n{i}. Format: {seed.format}")
-        print(f"   Content: {seed.content[:100]}...")
-        print(f"   Rationale: {seed.metadata.get('rationale', 'N/A')}")
+            # 第一轮：生成初始种子
+            seed1 = await generator.generate_seed(target_info, vuln_info)
+            print("\n=== Round 1: Generated seed ===")
+            print(f"   Format: {seed1.input_format}")
+            print(f"   Content: {seed1.content[:100]}...")
+            print(f"   Rationale: {seed1.metadata.get('rationale', 'N/A')}")
+
+            # 第二轮：基于覆盖反馈生成新种子
+            coverage_feedback = {
+                "covered_nodes": ["0x41904c", "0x419054"],
+                "uncovered_nodes": ["0x41906c", "0x419084", "0x419134", "0x41913c"],
+                "coverage_rate": 0.33
+            }
+            seed2 = await generator.generate_seed(target_info, vuln_info, coverage_feedback)
+            print("\n=== Round 2: Adjusted seed ===")
+            print(f"   Format: {seed2.input_format}")
+            print(f"   Content: {seed2.content[:100]}...")
+            print(f"   Strategy: {seed2.metadata.get('strategy', 'N/A')}")
+
+            # 第三轮：继续调整
+            coverage_feedback2 = {
+                "covered_nodes": ["0x41904c", "0x419054", "0x41906c"],
+                "uncovered_nodes": ["0x419084", "0x419134", "0x41913c"],
+                "coverage_rate": 0.50
+            }
+            seed3 = await generator.generate_seed(target_info, vuln_info, coverage_feedback2)
+            print("\n=== Round 3: Further adjusted seed ===")
+            print(f"   Format: {seed3.input_format}")
+            print(f"   Content: {seed3.content[:100]}...")
+            print(f"   Analysis: {seed3.metadata.get('analysis', 'N/A')}")
+
+        finally:
+            # 关闭MCP连接
+            await generator.close()
+
+    # 运行异步main函数
+    asyncio.run(main())

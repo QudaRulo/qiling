@@ -130,18 +130,34 @@ class ICFG:
 
     def record_execution(self, address: int):
         """Record that a basic block was executed."""
+        # 无条件记录执行轨迹（包含循环和重复执行）
+        self.execution_trace.append(address)
+
+        # 更新节点的执行计数
         if address in self.nodes:
             self.nodes[address].execution_count += 1
-            self.execution_trace.append(address)
 
     def to_dict(self) -> dict:
-        """Export ICFG to dictionary format."""
+        """
+        Export ICFG to dictionary format for JSON.
+
+        Exports minimal information needed for path coverage analysis:
+        - execution_trace: Complete execution sequence (for ordering and coverage)
+        - nodes: Basic block information (address, size only - no execution counts)
+
+        Execution counts, detailed edges, and library calls are only in DOT format.
+        """
+        # Export minimal node info: only address and size (no execution_count, no successors)
+        minimal_nodes = {}
+        for addr, node in self.nodes.items():
+            minimal_nodes[hex(addr)] = {
+                'size': node.size
+            }
+
         return {
             'main_binary': self.main_image_path or 'N/A',
-            'nodes': {hex(addr): node.to_dict() for addr, node in sorted(self.nodes.items())},
-            'lib_calls': {hex(addr): sorted(list(libs)) for addr, libs in sorted(self.lib_calls.items())},
-            'lib_returns': {lib: [hex(addr) for addr in sorted(addrs)] for lib, addrs in sorted(self.lib_returns.items())},
-            'lib_to_lib': {lib: sorted(list(libs)) for lib, libs in sorted(self.lib_to_lib.items())}
+            'execution_trace': [hex(addr) for addr in self.execution_trace],
+            'nodes': minimal_nodes
         }
 
 
@@ -313,6 +329,9 @@ class QlICFGCoverage(QlBaseCoverage):
         # Add or update node and record execution
         self.icfg.add_node(address, size)
         self.icfg.record_execution(address)
+
+        # Debug: print basic block address
+        # ql.log.info(f"[BB] {hex(address)}")
 
         # Add edge from previous block to current block
         if self.prev_block is not None:

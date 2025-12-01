@@ -668,7 +668,11 @@ def ql_syscall_recv(ql: Qiling, sockfd: int, buf: int, length: int, flags: int):
     if isinstance(sock, int):
         return sock
 
-    content = sock.recv(length, flags)
+    try:
+        content = sock.recv(length, flags)
+    except ConnectionRefusedError as e:
+        ql.log.debug(f"recv() connection refused, returning error: {e}")
+        return -e.errno
 
     if content:
         ql.log.debug("recv() CONTENT:")

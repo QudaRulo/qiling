@@ -70,3 +70,4 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+vperify_output/*
